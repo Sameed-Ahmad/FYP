@@ -1,185 +1,271 @@
-import google.generativeai as genai
-import logging
-from typing import Dict, Any
-from config.settings import settings
+"""
+Enhanced SQL Generator with Schema Intelligence
+Converts natural language to SQL using Google Gemini with smart column selection.
+"""
 
-logging.basicConfig(level=logging.WARNING)
+import google.generativeai as genai
+import re
+from typing import Tuple, Optional
+import logging
+
 logger = logging.getLogger(__name__)
 
 
 class SQLGenerator:
-    """Generates SQL queries from natural language using Google Gemini (FREE!)"""
+    """Enhanced SQL generator with intelligent column selection"""
     
-    def __init__(self, schema_context: str):
-        genai.configure(api_key=settings.google_api_key)
-        # Using Gemini 2.0 Flash - Latest and fastest FREE model!
-        # Alternative models: 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp'
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        self.schema_context = schema_context
-    
-    def generate_sql(self, natural_language_query: str) -> Dict[str, Any]:
+    def __init__(self, api_key: str, schema_context: str):
         """
-        Convert natural language to SQL query using Gemini
+        Initialize SQL generator.
         
         Args:
-            natural_language_query: User's question in natural language
-            
-        Returns:
-            Dictionary containing SQL query and explanation
+            api_key: Google Gemini API key
+            schema_context: Database schema information
         """
-        prompt = f"""You are an expert SQL query generator. Given a natural language question and database schema, generate a valid PostgreSQL query.
+        genai.configure(api_key=api_key)
+        
+        # Use Gemini 2.0 Flash Experimental for best results
+        self.model = genai.GenerativeModel(
+            'gemini-2.0-flash-exp',
+            generation_config={
+                'temperature': 0.1,  # Low temperature for deterministic output
+                'max_output_tokens': 1000,
+            }
+        )
+        
+        self.schema_context = schema_context
+        self.system_prompt = self._build_system_prompt()
+    
+    def _build_system_prompt(self) -> str:
+        """Build comprehensive system prompt"""
+        return f"""You are an expert SQL query generator for PostgreSQL databases. Your task is to convert natural language queries into precise, efficient SQL queries.
 
 DATABASE SCHEMA:
 {self.schema_context}
 
-RULES:
-1. Generate ONLY SELECT queries (no INSERT, UPDATE, DELETE, DROP)
-2. Use proper JOIN syntax when needed
-3. Include appropriate WHERE clauses for filtering
-4. Use aggregate functions (COUNT, SUM, AVG, etc.) when appropriate
-5. Add ORDER BY and LIMIT clauses when relevant
-6. Return ONLY valid SQL, no explanations in the query itself
-7. Use table and column names exactly as they appear in the schema
-8. Be case-insensitive for table and column matching
+CRITICAL RULES FOR COLUMN SELECTION:
+1. **ONLY select columns that are explicitly requested or necessary**
+2. If user asks for "names" → SELECT ONLY name columns
+3. If user asks for "top N" → SELECT requested columns + ordering column
+4. If user asks to "compare A and B" → SELECT ONLY A and B columns
+5. AVOID SELECT * unless user explicitly asks for "all information"
+6. For counts → Use COUNT(*) or COUNT(column), don't select all columns
+7. For aggregations → SELECT only grouped columns and aggregate results
 
-USER QUESTION: {natural_language_query}
+EXAMPLES OF CORRECT COLUMN SELECTION:
+- "Show me customer names" → SELECT customer_name FROM customers
+- "Top 5 expensive products" → SELECT product_name, price FROM products ORDER BY price DESC LIMIT 5
+- "Compare product prices" → SELECT product_name, price FROM products
+- "Count customers" → SELECT COUNT(*) as customer_count FROM customers
+- "Average price by category" → SELECT category, AVG(price) as avg_price FROM products GROUP BY category
 
-Please respond in this exact format:
+SQL GENERATION RULES:
+1. Use proper JOINs with explicit ON conditions
+2. Follow foreign key relationships from schema
+3. Use meaningful aliases (e.g., c for customers, p for products)
+4. Include ORDER BY for "top", "best", "highest", "latest" queries
+5. Use LIMIT for "top N" or "first N" requests
+6. Use GROUP BY for aggregations by category
+7. Use HAVING for filtered aggregates
+8. Handle NULL values appropriately
+9. Use DISTINCT when avoiding duplicates
+10. Always use exact table and column names from schema
+
+SECURITY CONSTRAINTS:
+- ONLY generate SELECT queries
+- NO INSERT, UPDATE, DELETE, DROP, or any modification queries
+- NO UNION or multiple statements
+- NO stored procedures or dynamic SQL
+
+OUTPUT FORMAT:
+Return your response in this exact format:
+
 ```sql
-[YOUR SQL QUERY HERE]
+[Your SQL query here]
 ```
 
-EXPLANATION:
-[Brief explanation of what the query does]"""
+Explanation: [Brief explanation of what the query does and why you selected specific columns]
 
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=1000,
-                )
-            )
-            
-            content = response.text
-            
-            # Extract SQL query from markdown code block
-            sql_query = self._extract_sql(content)
-            explanation = self._extract_explanation(content)
-            
-            logger.info(f"Generated SQL: {sql_query}")
-            
-            return {
-                "sql": sql_query,
-                "explanation": explanation,
-                "original_query": natural_language_query
-            }
-            
-        except Exception as e:
-            logger.error(f"Error generating SQL: {str(e)}")
-            raise Exception(f"Failed to generate SQL query: {str(e)}")
+Now generate a SQL query for the following request:"""
     
-    def _extract_sql(self, content: str) -> str:
-        """Extract SQL query from markdown code block"""
-        lines = content.split('\n')
-        sql_lines = []
-        in_code_block = False
-        
-        for line in lines:
-            if line.strip().startswith('```sql') or line.strip().startswith('```'):
-                in_code_block = not in_code_block
-                continue
-            if in_code_block:
-                sql_lines.append(line)
-        
-        # If no code block found, try to find SQL directly
-        if not sql_lines:
-            for line in lines:
-                upper_line = line.strip().upper()
-                if upper_line.startswith('SELECT') or upper_line.startswith('WITH'):
-                    sql_lines.append(line)
-                    # Get the rest of the query
-                    idx = lines.index(line)
-                    for remaining_line in lines[idx+1:]:
-                        stripped = remaining_line.strip()
-                        if stripped and not stripped.upper().startswith('EXPLANATION'):
-                            sql_lines.append(remaining_line)
-                        elif stripped.upper().startswith('EXPLANATION'):
-                            break
-                    break
-        
-        return '\n'.join(sql_lines).strip()
-    
-    def _extract_explanation(self, content: str) -> str:
-        """Extract explanation from response"""
-        lines = content.split('\n')
-        explanation_lines = []
-        in_explanation = False
-        skip_code_block = False
-        
-        for line in lines:
-            if '```' in line:
-                skip_code_block = not skip_code_block
-                continue
-            
-            if 'EXPLANATION' in line.upper():
-                in_explanation = True
-                continue
-                
-            if not skip_code_block and in_explanation:
-                if line.strip():
-                    explanation_lines.append(line)
-        
-        # If no explanation found after EXPLANATION marker, get text after code block
-        if not explanation_lines:
-            after_code = False
-            for line in lines:
-                if '```' in line:
-                    after_code = not after_code
-                    continue
-                if after_code and line.strip() and not line.strip().upper().startswith('SELECT'):
-                    explanation_lines.append(line)
-        
-        explanation = '\n'.join(explanation_lines).strip()
-        return explanation if explanation else "Query generated successfully"
-    
-    def refine_query(self, sql_query: str, feedback: str) -> str:
+    def generate_sql(
+        self,
+        natural_language_query: str,
+        additional_context: str = None
+    ) -> Tuple[str, str]:
         """
-        Refine an existing SQL query based on feedback
+        Generate SQL from natural language.
         
         Args:
-            sql_query: Existing SQL query
-            feedback: User feedback for refinement
+            natural_language_query: User's question in plain English
+            additional_context: Additional context (intent, entities, etc.)
+            
+        Returns:
+            Tuple of (sql_query, explanation)
+            
+        Raises:
+            Exception: If generation fails
+        """
+        try:
+            # Build full prompt
+            prompt_parts = [self.system_prompt]
+            
+            if additional_context:
+                prompt_parts.append(f"\nAdditional Context:\n{additional_context}\n")
+            
+            prompt_parts.append(f"\nUser Query: {natural_language_query}")
+            
+            full_prompt = "\n".join(prompt_parts)
+            
+            logger.debug(f"Generating SQL for: {natural_language_query}")
+            
+            # Generate SQL
+            response = self.model.generate_content(full_prompt)
+            
+            if not response or not response.text:
+                raise Exception("Empty response from Gemini API")
+            
+            # Extract SQL and explanation
+            sql = self._extract_sql(response.text)
+            explanation = self._extract_explanation(response.text)
+            
+            if not sql:
+                raise Exception("Could not extract SQL from response")
+            
+            logger.debug(f"Generated SQL: {sql}")
+            
+            return sql, explanation
+            
+        except Exception as e:
+            logger.error(f"SQL generation failed: {str(e)}")
+            raise Exception(f"Failed to generate SQL: {str(e)}")
+    
+    def refine_query(
+        self,
+        original_query: str,
+        feedback: str,
+        natural_language_query: str
+    ) -> str:
+        """
+        Refine SQL query based on validation feedback.
+        
+        Args:
+            original_query: The SQL query that failed validation
+            feedback: Validation errors/warnings
+            natural_language_query: Original natural language query
             
         Returns:
             Refined SQL query
+            
+        Raises:
+            Exception: If refinement fails
         """
-        prompt = f"""Given this SQL query:
+        try:
+            refinement_prompt = f"""
+The following SQL query has issues:
+
 ```sql
-{sql_query}
+{original_query}
 ```
 
-User feedback: {feedback}
+Feedback:
+{feedback}
 
-Generate an improved SQL query based on the feedback. 
+Original user request: {natural_language_query}
 
-DATABASE SCHEMA:
-{self.schema_context}
+Please generate a corrected SQL query that addresses all the issues mentioned in the feedback.
+Remember the column selection rules:
+- Only select columns that are explicitly needed
+- Avoid SELECT * unless all columns are requested
+- For "name" queries, only return name columns
+- For "top N" queries, only return relevant columns plus ordering column
 
-Return only the SQL query in a code block."""
-
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=1000,
-                )
-            )
+Return ONLY the corrected SQL query in a code block.
+"""
+            
+            response = self.model.generate_content(refinement_prompt)
+            
+            if not response or not response.text:
+                raise Exception("Empty response from Gemini API during refinement")
             
             refined_sql = self._extract_sql(response.text)
+            
+            if not refined_sql:
+                raise Exception("Could not extract refined SQL from response")
+            
+            logger.debug(f"Refined SQL: {refined_sql}")
+            
             return refined_sql
             
         except Exception as e:
-            logger.error(f"Error refining query: {str(e)}")
-            return sql_query
+            logger.error(f"SQL refinement failed: {str(e)}")
+            raise Exception(f"Failed to refine SQL: {str(e)}")
+    
+    def _extract_sql(self, response_text: str) -> Optional[str]:
+        """
+        Extract SQL query from markdown code blocks.
+        
+        Args:
+            response_text: Raw response from Gemini
+            
+        Returns:
+            Extracted SQL query or None
+        """
+        # Try to find SQL in code blocks
+        sql_pattern = r'```sql\s*(.*?)\s*```'
+        matches = re.findall(sql_pattern, response_text, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            return matches[0].strip()
+        
+        # Try generic code blocks
+        code_pattern = r'```\s*(.*?)\s*```'
+        matches = re.findall(code_pattern, response_text, re.DOTALL)
+        
+        if matches:
+            return matches[0].strip()
+        
+        # If no code blocks, try to find SELECT statement
+        select_pattern = r'(SELECT\s+.*?;)'
+        matches = re.findall(select_pattern, response_text, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            return matches[0].strip()
+        
+        # Last resort: check if entire response looks like SQL
+        if response_text.strip().upper().startswith('SELECT'):
+            # Remove any trailing explanation
+            sql_lines = []
+            for line in response_text.split('\n'):
+                if line.strip().upper().startswith('EXPLANATION'):
+                    break
+                sql_lines.append(line)
+            return '\n'.join(sql_lines).strip()
+        
+        return None
+    
+    def _extract_explanation(self, response_text: str) -> str:
+        """
+        Extract explanation from response.
+        
+        Args:
+            response_text: Raw response from Gemini
+            
+        Returns:
+            Explanation text
+        """
+        # Look for "Explanation:" marker
+        explanation_pattern = r'Explanation:\s*(.*?)(?:\n\n|$)'
+        matches = re.findall(explanation_pattern, response_text, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            return matches[0].strip()
+        
+        # If no explicit explanation, try to extract text after code block
+        parts = response_text.split('```')
+        if len(parts) > 2:
+            explanation = parts[2].strip()
+            if explanation:
+                return explanation
+        
+        return "Query generated to fulfill the request."

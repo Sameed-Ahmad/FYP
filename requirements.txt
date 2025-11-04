@@ -1,21 +1,20 @@
-
-# Google Gemini
-# Get API key from: https://makersuite.google.com/app/apikey
-google-generativeai==0.5.0
+# Core AI & LLM - Let pip resolve versions
+google-generativeai
+langgraph
+langchain-google-genai
 
 # Database
-psycopg2-binary==2.9.9
-sqlalchemy==2.0.30
+psycopg2-binary
+sqlalchemy
 
-# Environment and Configuration
-python-dotenv==1.0.1
-pydantic==2.7.0
-pydantic-settings==2.2.1
+# Configuration & Validation
+pydantic
+pydantic-settings
+python-dotenv
+
+# CLI & Output
+rich
+prompt-toolkit
 
 # Utilities
-requests==2.31.0
-typing-extensions==4.11.0
-
-# CLI and UI
-rich==13.7.1
-prompt-toolkit==3.0.43
+typing-extensions
